@@ -1,0 +1,295 @@
+name: Build, scan, and publish container
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: Dockerfile path in the calling repository
+        required: true
+        type: string
+      image-name:
+        description: GHCR repository name without registry or owner
+        required: true
+        type: string
+      context:
+        type: string
+        default: .
+      build-args:
+        description: Newline-separated non-secret Docker build arguments
+        type: string
+        default: ''
+      platforms:
+        description: Optional comma-separated publish platforms; empty publishes the scanned local image
+        type: string
+        default: ''
+      runner:
+        description: Linux runner label with Docker available
+        type: string
+        default: ubuntu-latest
+      cache-scope:
+        description: Unique cache and SARIF category for this service/variant
+        required: true
+        type: string
+      version-file:
+        description: Plain text version file, or package.json
+        type: string
+        default: VERSION
+      version-format:
+        description: text or json (reads the version property)
+        type: string
+        default: text
+      publish-ghcr:
+        type: boolean
+        default: true
+      publish-ecr:
+        type: boolean
+        default: false
+      aws-role-arn:
+        type: string
+        default: ''
+      aws-region:
+        type: string
+        default: us-east-1
+      ecr-registry:
+        description: ECR hostname; defaults to the authenticated account registry
+        type: string
+        default: ''
+      ecr-repository:
+        description: Existing ECR repository path, such as acs/authentication
+        type: string
+        default: ''
+      trivy-ignore-file:
+        type: string
+        default: .trivyignore
+    secrets:
+      build-secrets:
+        description: Newline-separated BuildKit id=value secrets
+        required: false
+    outputs:
+      sha_short:
+        description: Short commit SHA used for image tags
+        value: ${{ jobs.publish.outputs.sha_short }}
+      ghcr-published:
+        value: ${{ jobs.publish.outputs.ghcr-published }}
+      ecr-published:
+        value: ${{ jobs.publish.outputs.ecr-published }}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      id-token: write
+    outputs:
+      sha_short: ${{ steps.image.outputs.sha_short }}
+      ghcr-published: ${{ steps.result.outputs.ghcr }}
+      ecr-published: ${{ steps.result.outputs.ecr }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Checkout intentionally resolves the CALLER's repository and commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        if: inputs.platforms != ''
+
+      - name: Lint Dockerfile
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          docker run --rm -i hadolint/hadolint:v2.14.0 \
+            hadolint --failure-threshold error - < "$DOCKERFILE"
+
+      - name: Compute image tags
+        id: image
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          VERSION_FILE: ${{ inputs.version-file }}
+          VERSION_FORMAT: ${{ inputs.version-format }}
+          GHCR_ENABLED: ${{ inputs.publish-ghcr }}
+          ECR_ENABLED: ${{ inputs.publish-ecr }}
+        run: |
+          set -euo pipefail
+          if [ "$GHCR_ENABLED" != true ] && [ "$ECR_ENABLED" != true ]; then
+            echo "::error::At least one registry must be enabled"; exit 1
+          fi
+          case "$VERSION_FORMAT" in
+            text) VERSION=$(tr -d '\r\n' < "$VERSION_FILE") ;;
+            json) VERSION=$(jq -er '.version | strings' "$VERSION_FILE") ;;
+            *) echo "::error::version-format must be text or json"; exit 1 ;;
+          esac
+          [[ "$VERSION" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || {
+            echo "::error::Invalid Docker version tag"; exit 1;
+          }
+          OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image locally
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: false
+          load: true
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
+          tags: |
+            ${{ steps.image.outputs.sha_tag }}
+            ${{ steps.image.outputs.latest_tag }}
+            ${{ steps.image.outputs.version_tag }}
+          cache-from: type=gha,scope=${{ inputs.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}
+
+      - name: Scan image for vulnerabilities
+        id: scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        with:
+          image-ref: ${{ steps.image.outputs.sha_tag }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          trivyignores: ${{ inputs.trivy-ignore-file }}
+          limit-severities-for-sarif: true
+          ignore-unfixed: true
+
+      - name: Upload scan results
+        if: always() && steps.scan.outcome != 'skipped'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-${{ inputs.cache-scope }}
+
+      # Each registry gets an independent attempt, after the scan gate passes.
+      - name: Log in to GHCR
+        id: ghcr_login
+        if: inputs.publish-ghcr
+        continue-on-error: true
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        id: ghcr_push
+        if: inputs.publish-ghcr && steps.ghcr_login.outcome == 'success' && inputs.platforms == ''
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          SHA: ${{ steps.image.outputs.sha_short }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          for tag in "sha-$SHA" latest "$VERSION"; do
+            docker push "${IMAGE}:${tag}"
+          done
+
+      - name: Publish GHCR platform manifests
+        id: ghcr_multi_push
+        if: inputs.publish-ghcr && steps.ghcr_login.outcome == 'success' && inputs.platforms != ''
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          tags: |
+            ${{ steps.image.outputs.sha_tag }}
+            ${{ steps.image.outputs.latest_tag }}
+            ${{ steps.image.outputs.version_tag }}
+          cache-from: type=gha,scope=${{ inputs.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}
+
+      - name: Authenticate to AWS
+        id: aws_auth
+        if: inputs.publish-ecr && inputs.aws-role-arn != ''
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to ECR
+        id: ecr_login
+        if: steps.aws_auth.outcome == 'success'
+        continue-on-error: true
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Push to ECR
+        id: ecr_push
+        if: steps.ecr_login.outcome == 'success' && inputs.platforms == ''
+        continue-on-error: true
+        env:
+          REGISTRY: ${{ inputs.ecr-registry || steps.ecr_login.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          SHA: ${{ steps.image.outputs.sha_short }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$REPOSITORY" || { echo "::error::ecr-repository is required"; exit 1; }
+          for tag in "sha-$SHA" latest "$VERSION"; do
+            docker tag "${IMAGE}:${tag}" "${REGISTRY}/${REPOSITORY}:${tag}"
+            docker push "${REGISTRY}/${REPOSITORY}:${tag}"
+          done
+
+      - name: Publish ECR platform manifests
+        id: ecr_multi_push
+        if: steps.ecr_login.outcome == 'success' && inputs.platforms != ''
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          tags: |
+            ${{ inputs.ecr-registry || steps.ecr_login.outputs.registry }}/${{ inputs.ecr-repository }}:sha-${{ steps.image.outputs.sha_short }}
+            ${{ inputs.ecr-registry || steps.ecr_login.outputs.registry }}/${{ inputs.ecr-repository }}:latest
+            ${{ inputs.ecr-registry || steps.ecr_login.outputs.registry }}/${{ inputs.ecr-repository }}:${{ steps.image.outputs.version }}
+          cache-from: type=gha,scope=${{ inputs.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}
+
+      - name: Report publish outcome
+        id: result
+        if: always()
+        env:
+          GHCR: ${{ inputs.platforms != '' && steps.ghcr_multi_push.outcome || steps.ghcr_push.outcome }}
+          ECR: ${{ inputs.platforms != '' && steps.ecr_multi_push.outcome || steps.ecr_push.outcome }}
+          GHCR_ENABLED: ${{ inputs.publish-ghcr }}
+          ECR_ENABLED: ${{ inputs.publish-ecr }}
+        run: |
+          set -euo pipefail
+          echo "ghcr=$GHCR" >> "$GITHUB_OUTPUT"
+          echo "ecr=$ECR" >> "$GITHUB_OUTPUT"
+          echo "GHCR: $GHCR   ECR: $ECR"
+          if [ "$GHCR" != success ] && [ "$ECR" != success ]; then
+            echo "::error::Neither registry accepted the image"; exit 1
+          fi
+          if [ "$GHCR_ENABLED" = true ] && [ "$GHCR" != success ]; then
+            echo "::warning::GHCR publication failed or was skipped"
+          fi
+          if [ "$ECR_ENABLED" = true ] && [ "$ECR" != success ]; then
+            echo "::warning::ECR publication failed or was skipped"
+          fi

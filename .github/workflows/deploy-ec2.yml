@@ -1,0 +1,115 @@
+name: Deploy container service to EC2 through SSM
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      image-tag:
+        description: Immutable tag accepted by the host's deploy document
+        required: true
+        type: string
+      aws-role-arn:
+        required: true
+        type: string
+      aws-region:
+        type: string
+        default: us-east-1
+      ssm-document:
+        description: Existing SSM document with Service and ImageTag parameters
+        required: true
+        type: string
+      instance-id:
+        required: true
+        type: string
+      runner:
+        type: string
+        default: ubuntu-latest
+      timeout-seconds:
+        description: Maximum wait for the remote command, including delivery
+        type: number
+        default: 900
+    outputs:
+      command-id:
+        value: ${{ jobs.deploy.outputs.command-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      command-id: ${{ steps.deploy.outputs.command-id }}
+    defaults:
+      run:
+        shell: bash
+    # Callers must also serialize matrix entries (max-parallel: 1).
+    # This lock coordinates different workflow runs against the same host.
+    concurrency:
+      group: ec2-compose-${{ inputs.aws-region }}-${{ inputs.instance-id }}
+      cancel-in-progress: false
+    steps:
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Deploy service and wait for completion
+        id: deploy
+        env:
+          DOC: ${{ inputs.ssm-document }}
+          INSTANCE: ${{ inputs.instance-id }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ inputs.image-tag }}
+          WAIT_SECONDS: ${{ inputs.timeout-seconds }}
+        run: |
+          set -euo pipefail
+          test -n "$DOC" && test -n "$INSTANCE" && test -n "$SERVICE" && test -n "$TAG"
+          [[ "$WAIT_SECONDS" =~ ^[0-9]+$ ]] && (( WAIT_SECONDS > 0 && WAIT_SECONDS <= 1500 )) || {
+            echo "::error::timeout-seconds must be an integer from 1 to 1500"; exit 1;
+          }
+          PARAMS=$(jq -cn --arg service "$SERVICE" --arg tag "$TAG" \
+            '{Service:[$service],ImageTag:[$tag]}')
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "$DOC" --instance-ids "$INSTANCE" \
+            --parameters "$PARAMS" \
+            --comment "deploy $SERVICE $TAG run $GITHUB_RUN_ID" \
+            --query 'Command.CommandId' --output text)
+          echo "command-id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $COMMAND_ID"
+
+          DEADLINE=$((SECONDS + WAIT_SECONDS))
+          STATUS=Pending
+          while (( SECONDS < DEADLINE )); do
+            # A newly submitted command may not be visible immediately.
+            if INVOCATION=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE" \
+              --output json 2>ssm-error.txt); then
+              STATUS=$(jq -r '.Status' <<< "$INVOCATION")
+              case "$STATUS" in
+                Success|Failed|Cancelled|TimedOut) break ;;
+                Pending|InProgress|Delayed|Cancelling) ;;
+                *) echo "::error::Unexpected SSM status: $STATUS"; break ;;
+              esac
+            elif ! grep -q 'InvocationDoesNotExist' ssm-error.txt; then
+              cat ssm-error.txt >&2
+              echo "::error::Cannot read SSM command status"; exit 1
+            fi
+            sleep 5
+          done
+
+          if [ -n "${INVOCATION:-}" ]; then
+            jq -r '.StandardOutputContent, .StandardErrorContent' <<< "$INVOCATION"
+          fi
+          if [ "$STATUS" != Success ]; then
+            echo "::error::Deploy of $SERVICE ended as $STATUS (wait limit ${WAIT_SECONDS}s)"
+            exit 1
+          fi
+          echo "$SERVICE is running $TAG"
