@@ -18,6 +18,10 @@ on:
         description: Newline-separated non-secret Docker build arguments
         type: string
         default: ''
+      build-contexts:
+        description: Newline-separated named BuildKit contexts, such as content=./content
+        type: string
+        default: ''
       platforms:
         description: Optional comma-separated publish platforms; empty publishes the scanned local image
         type: string
@@ -146,6 +150,7 @@ jobs:
           push: false
           load: true
           build-args: ${{ inputs.build-args }}
+          build-contexts: ${{ inputs.build-contexts }}
           secrets: ${{ secrets.build-secrets }}
           tags: |
             ${{ steps.image.outputs.sha_tag }}
@@ -209,6 +214,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           build-args: ${{ inputs.build-args }}
+          build-contexts: ${{ inputs.build-contexts }}
           secrets: ${{ secrets.build-secrets }}
           push: true
           platforms: ${{ inputs.platforms }}
@@ -261,6 +267,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           build-args: ${{ inputs.build-args }}
+          build-contexts: ${{ inputs.build-contexts }}
           secrets: ${{ secrets.build-secrets }}
           push: true
           platforms: ${{ inputs.platforms }}

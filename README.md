@@ -45,6 +45,9 @@ Optional build inputs: `context` (`.`), `runner` (`ubuntu-latest`), `build-args`
 (newline-separated non-secret arguments), `version-file` (`VERSION`),
 `version-format` (`text`, or `json` to read `.version`), and `trivy-ignore-file`
 (`.trivyignore`). Give each service/variant a distinct `cache-scope`.
+Use `build-contexts` for newline-separated named BuildKit contexts, such as
+`content=./content` for plAIbook's UI media. It is forwarded to both the local
+scan build and optional multi-platform publish builds.
 Set `platforms: linux/amd64,linux/arm64` to publish multi-architecture manifests,
 as ACS requires for its Graviton EC2 host. This enables QEMU, scans a local build
 for the runner architecture, then builds and pushes each registry's platform
