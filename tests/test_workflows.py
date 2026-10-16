@@ -107,6 +107,35 @@ class WorkflowTests(unittest.TestCase):
                                  result.stderr)
                 self.assertIn('command-id=command-123', output)
 
+    def test_ssm_cloudwatch_output_is_optional(self):
+        script = step('deploy-ec2.yml', 'Deploy service and wait for completion')
+        prelude = """
+          sleep() { :; }
+          aws() {
+            if [ "$2" = send-command ]; then echo "$*" > send-args; echo command-123
+            else printf '{"Status":"Success","StandardOutputContent":"","StandardErrorContent":""}'
+            fi
+          }
+        """
+        for group in ['', '/app/prod/ssm']:
+            with self.subTest(group=group):
+                result, _ = self.run_shell(script + '\ncat send-args', {
+                    'DOC': 'deploy-service', 'INSTANCE': 'i-123', 'SERVICE': 'api',
+                    'TAG': 'sha-abc1234', 'WAIT_SECONDS': '1', 'LOG_GROUP': group,
+                }, prelude=prelude)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if group:
+                    self.assertIn('--cloud-watch-output-config CloudWatchOutputEnabled=true,'
+                                  'CloudWatchLogGroupName=/app/prod/ssm', result.stdout)
+                else:
+                    self.assertNotIn('cloud-watch-output-config', result.stdout)
+
+    def test_deploy_job_uses_the_requested_environment(self):
+        document = yaml.safe_load((ROOT / '.github/workflows/deploy-ec2.yml').read_text(encoding='utf-8'))
+        inputs = document[True]['workflow_call']['inputs']
+        self.assertEqual(inputs['environment']['default'], '')
+        self.assertEqual(document['jobs']['deploy']['environment'], '${{ inputs.environment }}')
+
     def test_ssm_eventual_consistency_and_timeout(self):
         prelude = '''
           sleep() { :; }

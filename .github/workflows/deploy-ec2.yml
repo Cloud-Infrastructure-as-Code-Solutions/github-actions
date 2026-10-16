@@ -30,6 +30,16 @@ on:
         description: Maximum wait for the remote command, including delivery
         type: number
         default: 900
+      environment:
+        description: >-
+          GitHub environment for the deploy job. Its protection rules gate the
+          AWS credentials, and the OIDC subject becomes repo:<owner>/<repo>:environment:<name>.
+        type: string
+        default: ''
+      cloudwatch-log-group:
+        description: Existing CloudWatch log group for the full SSM command output; empty disables it
+        type: string
+        default: ''
     outputs:
       command-id:
         value: ${{ jobs.deploy.outputs.command-id }}
@@ -41,6 +51,7 @@ jobs:
   deploy:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
+    environment: ${{ inputs.environment }}
     permissions:
       contents: read
       id-token: write
@@ -69,6 +80,7 @@ jobs:
           SERVICE: ${{ inputs.service }}
           TAG: ${{ inputs.image-tag }}
           WAIT_SECONDS: ${{ inputs.timeout-seconds }}
+          LOG_GROUP: ${{ inputs.cloudwatch-log-group }}
         run: |
           set -euo pipefail
           test -n "$DOC" && test -n "$INSTANCE" && test -n "$SERVICE" && test -n "$TAG"
@@ -77,9 +89,14 @@ jobs:
           }
           PARAMS=$(jq -cn --arg service "$SERVICE" --arg tag "$TAG" \
             '{Service:[$service],ImageTag:[$tag]}')
+          # get-command-invocation truncates output; CloudWatch keeps all of it.
+          LOGGING=()
+          if [ -n "${LOG_GROUP:-}" ]; then
+            LOGGING=(--cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=$LOG_GROUP")
+          fi
           COMMAND_ID=$(aws ssm send-command \
             --document-name "$DOC" --instance-ids "$INSTANCE" \
-            --parameters "$PARAMS" \
+            --parameters "$PARAMS" "${LOGGING[@]}" \
             --comment "deploy $SERVICE $TAG run $GITHUB_RUN_ID" \
             --query 'Command.CommandId' --output text)
           echo "command-id=$COMMAND_ID" >> "$GITHUB_OUTPUT"

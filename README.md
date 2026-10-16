@@ -98,8 +98,19 @@ bootstraps the host nor requires SSH keys.
 ```
 
 All six inputs shown are required. Optional inputs are `aws-region` (`us-east-1`),
-`runner` (`ubuntu-latest`), and `timeout-seconds` (`900`, integer 1–1500). The output
-is `command-id`. The runner needs AWS CLI, bash, and jq. The workflow tolerates SSM
+`runner` (`ubuntu-latest`), `timeout-seconds` (`900`, integer 1–1500), `environment`,
+and `cloudwatch-log-group`. The output is `command-id`.
+
+Set `environment` (for example `production`) to run the deploy job in that GitHub
+environment. A calling job that uses a reusable workflow cannot set `environment`
+itself, so this input is how required reviewers gate the deployment. The job's OIDC
+subject then becomes `repo:<owner>/<repo>:environment:<name>`; trust exactly that
+subject in the deploy role so no other job can assume it. Set `cloudwatch-log-group`
+to an existing log group to keep the full SSM output, which `get-command-invocation`
+truncates. The instance role then needs `logs:CreateLogStream`, `logs:PutLogEvents`,
+`logs:DescribeLogStreams` on that group and `logs:DescribeLogGroups`.
+
+The runner needs AWS CLI, bash, and jq. The workflow tolerates SSM
 eventual consistency, reports remote stdout/stderr, and fails on command failure,
 cancellation, timeout, or an AWS API error. The job has a 30-minute upper limit.
 
